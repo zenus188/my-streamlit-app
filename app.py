@@ -1,58 +1,76 @@
-diff --git a/app.py b/app.py
-index 8361eeba2c3eaa697385fcba1373626f171d0d46..576236b5d8f475e671e5f0a153197b4f7a27efaf 100644
---- a/app.py
-+++ b/app.py
-@@ -1,37 +1,43 @@
- import streamlit as st
- from openai import OpenAI
- 
--st.title("🤖 나의 AI 챗봇")
--
--# 사이드바에서 API Key 입력
--api_key = st.sidebar.text_input("OpenAI API Key", type="password")
--
--# 대화 기록 초기화
--if "messages" not in st.session_state:
--    st.session_state.messages = []
-+st.title("🤖 나의 AI 챗봇")
-+
-+# 사이드바에서 API Key 입력
-+api_key = st.sidebar.text_input("OpenAI API Key", type="password")
-+
-+st.sidebar.subheader("오늘의 기분")
-+mood_options = ["😀 매우 좋음", "🙂 좋음", "😐 보통", "🙁 나쁨", "😞 매우 나쁨"]
-+selected_mood = st.sidebar.selectbox("현재 기분을 선택하세요", mood_options)
-+
-+# 대화 기록 초기화
-+if "messages" not in st.session_state:
-+    st.session_state.messages = []
-+
-+st.info(f"현재 선택한 기분: {selected_mood}")
- 
- # 이전 대화 표시
- for message in st.session_state.messages:
-     with st.chat_message(message["role"]):
-         st.markdown(message["content"])
- 
- # 사용자 입력 처리
- if prompt := st.chat_input("메시지를 입력하세요"):
-     if not api_key:
-         st.error("⚠️ 사이드바에서 API Key를 입력해주세요!")
-     else:
-         # 사용자 메시지 저장 및 표시
-         st.session_state.messages.append({"role": "user", "content": prompt})
-         with st.chat_message("user"):
-             st.markdown(prompt)
-         
-         # AI 응답 생성
-         with st.chat_message("assistant"):
-             client = OpenAI(api_key=api_key)
-             response = client.chat.completions.create(
-                 model="gpt-4o-mini",
-                 messages=st.session_state.messages
-             )
-             reply = response.choices[0].message.content
-             st.markdown(reply)
--            st.session_state.messages.append({"role": "assistant", "content": reply})
-\ No newline at end of file
-+            st.session_state.messages.append({"role": "assistant", "content": reply})
+import streamlit as st
+
+# 페이지 설정
+st.set_page_config(page_title="나와 어울리는 영화는?", page_icon="🎬")
+
+# 제목
+st.title("🎬 나와 어울리는 영화는?")
+
+# 소개 문구
+st.write(
+    "간단한 심리테스트로 당신과 가장 잘 어울리는 영화 스타일을 알아보세요! "
+    "편하게 떠오르는 대로 선택해 주세요 😊"
+)
+
+st.divider()
+
+# 질문 1
+q1 = st.radio(
+    "1️⃣ 주말에 가장 하고 싶은 일은?",
+    [
+        "집에서 혼자 영화나 드라마 보기",
+        "친구들과 수다 떨며 놀기",
+        "즉흥적으로 여행 떠나기",
+        "혼자만의 시간을 가지며 생각 정리하기",
+    ],
+)
+
+# 질문 2
+q2 = st.radio(
+    "2️⃣ 영화에서 가장 중요한 요소는?",
+    [
+        "감동적인 스토리",
+        "웃음과 재미",
+        "긴장감 넘치는 전개",
+        "영상미와 분위기",
+    ],
+)
+
+# 질문 3
+q3 = st.radio(
+    "3️⃣ 새로운 환경에 놓였을 때 나는?",
+    [
+        "천천히 관찰하며 적응한다",
+        "먼저 다가가 사람들과 친해진다",
+        "재미있을 것 같아 바로 뛰어든다",
+        "속으로 많은 생각을 한다",
+    ],
+)
+
+# 질문 4
+q4 = st.radio(
+    "4️⃣ 내가 더 끌리는 주인공 유형은?",
+    [
+        "현실적이고 공감 가는 인물",
+        "밝고 유쾌한 인물",
+        "카리스마 넘치는 인물",
+        "조용하지만 깊이 있는 인물",
+    ],
+)
+
+# 질문 5
+q5 = st.radio(
+    "5️⃣ 영화가 끝난 후 남았으면 하는 느낌은?",
+    [
+        "마음이 따뜻해지는 여운",
+        "기분이 좋아지는 즐거움",
+        "짜릿한 흥분",
+        "곱씹게 되는 메시지",
+    ],
+)
+
+st.divider()
+
+# 결과 보기 버튼
+if st.button("🎥 결과 보기"):
+    st.subheader("분석 중...")
