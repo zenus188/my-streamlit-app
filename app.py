@@ -15,16 +15,29 @@ def build_client(api_key: str) -> OpenAI:
 
 def safe_json_loads(s: str) -> Dict[str, Any]:
     """
-    Responses API의 output_text는 보통 JSON 텍스트로 오지만,
-    혹시 모를 공백/코드펜스 등을 대비해 최대한 안전하게 파싱.
+    모델 출력이 JSON이어야 하지만, 혹시 코드펜스/여분 텍스트가 섞이면 최대한 방어적으로 제거.
     """
     s = s.strip()
-    # 코드펜스 제거(방어)
+
+    # 코드펜스 방어
     if s.startswith("```"):
-        s = s.strip("`")
-        # "json\n{...}" 형태 방어
+        # ```json\n{...}\n``` 같은 형태
+        s = s.strip("`").strip()
         if "\n" in s:
             s = s.split("\n", 1)[1].strip()
+        # 끝의 ``` 제거될 수도 있으니 한 번 더
+        if s.endswith("```"):
+            s = s[:-3].strip()
+
+    # 앞뒤 잡텍스트가 섞인 경우를 대비해 첫 '{' ~ 마지막 '}'만 잘라보기(최후의 방어)
+    if "{" in s and "}" in s:
+        s2 = s[s.find("{") : s.rfind("}") + 1].strip()
+        # 너무 공격적으로 자르면 깨질 수 있어서, 그래도 json 파싱 시도
+        try:
+            return json.loads(s2)
+        except Exception:
+            pass
+
     return json.loads(s)
 
 
@@ -52,91 +65,15 @@ def build_profile_text(
 """.strip()
 
 
-def recommendations_schema() -> Dict[str, Any]:
-    # Structured Outputs (json_schema) 스키마
-    return {
-        "type": "json_schema",
-        "json_schema": {
-            "name": "playmate_game_recommendations",
-            "description": "User preferences-based game recommendations with brief platform/price info.",
-            "strict": True,
-            "schema": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "recommendations": {
-                        "type": "array",
-                        "minItems": 5,
-                        "maxItems": 5,
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "properties": {
-                                "title": {"type": "string"},
-                                "genre": {"type": "string"},
-                                "platforms": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "minItems": 1,
-                                },
-                                "price_range_krw": {
-                                    "type": "string",
-                                    "description": "Approximate KRW price range (varies by store/region/sale).",
-                                },
-                                "store_hint": {
-                                    "type": "string",
-                                    "description": "Where to check price/platform (e.g., Steam/PS Store/eShop/Google Play).",
-                                },
-                                "why_recommended": {"type": "string"},
-                                "fit_emotions": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "minItems": 1,
-                                },
-                                "time_fit": {
-                                    "type": "string",
-                                    "description": "How it fits the user's daily playtime.",
-                                },
-                                "caution_or_note": {
-                                    "type": "string",
-                                    "description": "Any caution: difficulty, motion sickness, horror intensity, etc.",
-                                },
-                            },
-                            "required": [
-                                "title",
-                                "genre",
-                                "platforms",
-                                "price_range_krw",
-                                "store_hint",
-                                "why_recommended",
-                                "fit_emotions",
-                                "time_fit",
-                                "caution_or_note",
-                            ],
-                        },
-                    },
-                    "summary": {
-                        "type": "string",
-                        "description": "One short paragraph summarizing the overall recommendation logic.",
-                    },
-                    "price_disclaimer": {
-                        "type": "string",
-                        "description": "A clear disclaimer that prices vary by store/region/sales and should be verified.",
-                    },
-                },
-                "required": ["recommendations", "summary", "price_disclaimer"],
-            },
-        },
-    }
-
-
 def call_openai_chat(
     client: OpenAI,
     model: str,
     system_instructions: str,
     messages: List[Dict[str, str]],
 ) -> str:
-    # messages를 단일 input으로 합쳐서 전달(단순/견고)
+    """
+    일반 채팅(자연어 응답). Responses API 사용.
+    """
     convo = []
     for m in messages[-20:]:
         role = m.get("role", "user")
@@ -149,7 +86,7 @@ def call_openai_chat(
         instructions=system_instructions,
         input=input_text,
     )
-    return resp.output_text
+    return (resp.output_text or "").strip()
 
 
 def call_openai_recommendations(
@@ -158,26 +95,95 @@ def call_openai_recommendations(
     system_instructions: str,
     profile_text: str,
 ) -> Dict[str, Any]:
+    """
+    response_format을 쓰지 않고,
+    프롬프트로 '유효 JSON만 출력'을 강제 + 파싱 실패 시 1회 수정 요청.
+    """
+    schema_hint = {
+        "recommendations": [
+            {
+                "title": "string",
+                "genre": "string",
+                "platforms": ["string"],
+                "price_range_krw": "string",
+                "store_hint": "string",
+                "why_recommended": "string",
+                "fit_emotions": ["string"],
+                "time_fit": "string",
+                "caution_or_note": "string",
+            }
+        ],
+        "summary": "string",
+        "price_disclaimer": "string",
+    }
+
     prompt = f"""
 너는 게임 추천 전문가다.
-아래 [사용자 선호 프로필]을 기반으로, 사용자가 좋아할 가능성이 높은 게임 5개를 추천하라.
+아래 [사용자 선호 프로필]을 기반으로 게임 5개를 추천하라.
 
-- 반드시 5개만.
-- 사용자의 '비선호 장르'는 최대한 피하라.
-- 사용자의 '플랫폼/기기'에서 플레이 가능한 타이틀을 우선하라.
-- '가격'은 정확한 실시간 조회가 아니라 "대략적인 가격대(원)"로 제시하고, 어떤 스토어에서 확인하면 되는지(store_hint)를 적어라.
-- 출력은 지정된 JSON 스키마를 엄격히 따른다.
+중요(반드시 준수):
+- 출력은 "유효한 JSON" 하나만 출력한다. (설명/코드펜스/여분 텍스트/마크다운 금지)
+- recommendations는 정확히 5개 항목만 포함한다.
+- 비선호 장르는 최대한 피한다.
+- 사용자의 플랫폼에서 플레이 가능한 타이틀을 우선한다.
+- 가격은 실시간 조회가 아니라 "대략적인 가격대(원)"로 제시한다.
+- 어떤 스토어에서 확인하면 되는지도 store_hint에 적는다. (예: Steam/PS Store/eShop/Google Play 등)
+- 아래 JSON 키 이름을 정확히 그대로 사용한다.
 
+[JSON 스키마 예시]
+{json.dumps(schema_hint, ensure_ascii=False, indent=2)}
+
+[사용자 선호 프로필]
 {profile_text}
 """.strip()
 
+    # 1차 생성
     resp = client.responses.create(
         model=model,
         instructions=system_instructions,
         input=prompt,
-        response_format=recommendations_schema(),
     )
-    return safe_json_loads(resp.output_text)
+    text = (resp.output_text or "").strip()
+
+    # 1차 파싱
+    try:
+        obj = safe_json_loads(text)
+        if (
+            isinstance(obj, dict)
+            and "recommendations" in obj
+            and isinstance(obj["recommendations"], list)
+            and len(obj["recommendations"]) == 5
+        ):
+            return obj
+        raise ValueError("JSON parsed but recommendations length != 5 or schema mismatch")
+    except Exception:
+        # 2차: JSON만 다시 내놓게 수정 요청
+        fix_prompt = f"""
+아래 출력은 JSON 파싱에 실패했거나 조건을 어겼다.
+반드시 "유효한 JSON" 하나만 출력해서 수정해라. 다른 텍스트는 절대 출력하지 마라.
+조건: recommendations는 정확히 5개.
+
+[잘못된 출력]
+{text}
+""".strip()
+
+        resp2 = client.responses.create(
+            model=model,
+            instructions=system_instructions,
+            input=fix_prompt,
+        )
+        text2 = (resp2.output_text or "").strip()
+        obj2 = safe_json_loads(text2)
+
+        # 마지막 안전장치
+        if (
+            not isinstance(obj2, dict)
+            or "recommendations" not in obj2
+            or not isinstance(obj2["recommendations"], list)
+            or len(obj2["recommendations"]) != 5
+        ):
+            raise ValueError("모델이 올바른 JSON(추천 5개)을 반환하지 못했습니다.")
+        return obj2
 
 
 # -----------------------------
@@ -185,14 +191,14 @@ def call_openai_recommendations(
 # -----------------------------
 st.set_page_config(page_title="플레이메이트", layout="wide")
 
-# Sidebar (API key must be at top-left => put it first)
+# Sidebar - API key must be top-left => first element in sidebar
 with st.sidebar:
-    st.markdown("### 🔑 API 키")
+    st.markdown("### 🔑 API 키 (왼쪽 위)")
     api_key = st.text_input(
         "OpenAI API Key",
         type="password",
         placeholder="sk-... 또는 프로젝트 키",
-        help="키는 로컬에서만 사용되도록 구성하세요. (배포 시 st.secrets 권장)",
+        help="배포 시에는 st.secrets 사용을 권장.",
     )
     st.divider()
 
@@ -226,14 +232,14 @@ with st.sidebar:
 
     model = st.selectbox(
         "모델",
-        options=["gpt-5.2", "gpt-5", "gpt-4.1"],
+        options=["gpt-4.1-mini", "gpt-4.1", "gpt-5", "gpt-5.2"],
         index=0,
-        help="가용 모델은 계정/프로젝트 설정에 따라 다를 수 있어요.",
+        help="계정/프로젝트 설정에 따라 사용 가능 모델이 다를 수 있음.",
     )
 
     get_recs = st.button("✨ 추천 받기", use_container_width=True)
 
-
+# Main title
 st.title("플레이메이트")
 
 # Session state init
@@ -241,7 +247,7 @@ if "messages" not in st.session_state:
     st.session_state.messages = [
         {
             "role": "assistant",
-            "content": "안녕하세요! 저는 플레이메이트 🎮\n사이드바에서 취향을 고르고, 채팅으로 원하는 게임 느낌을 말해줘요. (예: '협동으로 30분씩 하기 좋은 거')",
+            "content": "안녕하세요! 저는 플레이메이트 🎮\n사이드바에서 취향을 고르고, 채팅으로 원하는 느낌을 말해줘요. (예: '스위치로 30~60분씩 협동 가능한 게임')",
         }
     ]
 if "recommendations" not in st.session_state:
@@ -257,12 +263,11 @@ profile_text = build_profile_text(
 )
 
 system_instructions = f"""
-너는 '플레이메이트'라는 이름의 게임 추천 챗봇이다.
+너는 '플레이메이트'라는 게임 추천 챗봇이다.
 - 한국어로 답한다.
-- 사용자의 선호/비선호 장르, 원하는 감정, 플레이한 게임, 플랫폼, 하루 플레이시간을 최우선 반영한다.
-- 사실을 지어내지 않는다. (특히 가격/플랫폼의 정확한 실시간 정보는 단정하지 말 것)
-- 사용자가 원하는 경우에만 길게 설명하고, 기본은 짧고 명확하게.
-- 추천을 할 때는 사용자가 왜 좋아할지 2~3줄로 핵심만 말한다.
+- 사용자의 선호/비선호 장르, 원하는 감정, 재미있게 했던 게임, 플랫폼, 하루 플레이시간을 최우선 반영한다.
+- 가격/플랫폼은 지역/세일/스토어에 따라 달라질 수 있으므로 "대략"으로만 말하고, 단정하지 않는다.
+- 기본 답변은 짧고 명확하게. 사용자가 원하면 자세히 확장한다.
 
 {profile_text}
 """.strip()
@@ -279,7 +284,7 @@ if get_recs:
     else:
         try:
             client = build_client(api_key)
-            with st.spinner("취향 분석 중..."):
+            with st.spinner("취향 분석 및 추천 생성 중..."):
                 recs_obj = call_openai_recommendations(
                     client=client,
                     model=model,
@@ -295,31 +300,30 @@ if get_recs:
 recs_obj = st.session_state.recommendations
 if recs_obj:
     st.subheader("추천 게임 5선")
-    st.caption(recs_obj.get("price_disclaimer", ""))
+    st.caption(recs_obj.get("price_disclaimer", "가격은 스토어/지역/세일에 따라 달라질 수 있어요. 구매 전 스토어에서 확인하세요."))
 
     cols = st.columns(2)
     recs = recs_obj.get("recommendations", [])[:5]
     for i, r in enumerate(recs):
         col = cols[i % 2]
         with col:
-            st.markdown(f"### {i+1}. {r['title']}")
-            st.markdown(f"- **장르:** {r['genre']}")
-            st.markdown(f"- **플랫폼:** {', '.join(r['platforms'])}")
-            st.markdown(f"- **가격대(원):** {r['price_range_krw']}")
-            st.markdown(f"- **가격/구매 확인:** {r['store_hint']}")
-            st.markdown(f"- **추천 이유:** {r['why_recommended']}")
-            st.markdown(f"- **맞는 감정:** {', '.join(r['fit_emotions'])}")
-            st.markdown(f"- **시간 적합:** {r['time_fit']}")
-            st.markdown(f"- **주의/메모:** {r['caution_or_note']}")
+            st.markdown(f"### {i+1}. {r.get('title','')}")
+            st.markdown(f"- **장르:** {r.get('genre','')}")
+            st.markdown(f"- **플랫폼:** {', '.join(r.get('platforms', []))}")
+            st.markdown(f"- **가격대(원):** {r.get('price_range_krw','')}")
+            st.markdown(f"- **가격/구매 확인:** {r.get('store_hint','')}")
+            st.markdown(f"- **추천 이유:** {r.get('why_recommended','')}")
+            st.markdown(f"- **맞는 감정:** {', '.join(r.get('fit_emotions', []))}")
+            st.markdown(f"- **시간 적합:** {r.get('time_fit','')}")
+            st.markdown(f"- **주의/메모:** {r.get('caution_or_note','')}")
             st.divider()
 
     st.info(recs_obj.get("summary", ""))
 
-    # Let user quickly ask follow-up about a specific game
-    st.markdown("원하면 채팅에 이렇게 물어봐도 돼요: `2번 게임 비슷한 거 더 추천해줘`, `공포 강도 어느 정도야?`")
+    st.markdown("원하면 채팅에 이렇게 물어봐도 돼요: `2번이랑 비슷한 게임 더`, `공포 강도 얼마나 세?`, `모바일로만 다시 추천해줘`")
 
 # Chat input
-user_text = st.chat_input("원하는 게임 느낌을 말해줘 (예: '힐링 + 수집, 스위치로 1시간씩')")
+user_text = st.chat_input("원하는 게임 느낌을 말해줘 (예: '힐링+수집, 스위치로 하루 1시간')")
 
 if user_text:
     st.session_state.messages.append({"role": "user", "content": user_text})
@@ -345,7 +349,7 @@ if user_text:
             with st.chat_message("assistant"):
                 st.markdown(assistant_text)
         except Exception as e:
-            err = f"오류가 났어: {e}"
+            err = f"오류: {e}"
             st.session_state.messages.append({"role": "assistant", "content": err})
             with st.chat_message("assistant"):
                 st.markdown(err)
