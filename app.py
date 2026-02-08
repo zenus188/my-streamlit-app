@@ -25,6 +25,9 @@ TIMEOUT = 15
 CANDIDATE_COUNT = 18
 RAWG_MATCH_LIMIT = 18  # RAWG 팩트 확정 최대치 (모델에게 너무 많이 던지지 않기)
 
+# RAWG 키가 없을 때: 모델만으로 추천은 가능하되, "팩트(표지/출시일/플랫폼/장르)"는 보수적으로
+FALLBACK_MAX_RECS = 8
+
 
 # -----------------------------
 # Magazine UI (CSS)
@@ -182,6 +185,15 @@ section[data-testid="stSidebar"] button{
   margin: 12px 0;
 }
 
+/* Callout */
+.sg-callout{
+  border: 1px dashed rgba(255,255,255,.18);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  background: rgba(255,255,255,.03);
+  color: var(--muted);
+}
+
 /* Chat look */
 [data-testid="stChatMessage"]{
   border-radius: 16px;
@@ -236,8 +248,18 @@ def map_platform_choice_to_rawg_tokens(platform_choice: str) -> List[str]:
     return mapping.get(platform_choice, [])
 
 
+def platform_filter_pass(user_platforms: List[str], game_plats: List[str]) -> bool:
+    if not user_platforms:
+        return True
+    tokens: List[str] = []
+    for up in user_platforms:
+        tokens.extend(map_platform_choice_to_rawg_tokens(up))
+    gp = " | ".join(game_plats).lower()
+    return any(t.lower() in gp for t in tokens)
+
+
 # -----------------------------
-# RAWG API helpers
+# RAWG API helpers (optional)
 # -----------------------------
 def rawg_get(rawg_key: str, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not rawg_key:
@@ -294,16 +316,6 @@ def game_genres(detail: Dict[str, Any]) -> List[str]:
     return out
 
 
-def platform_filter_pass(user_platforms: List[str], game_plats: List[str]) -> bool:
-    if not user_platforms:
-        return True
-    tokens: List[str] = []
-    for up in user_platforms:
-        tokens.extend(map_platform_choice_to_rawg_tokens(up))
-    gp = " | ".join(game_plats).lower()
-    return any(t.lower() in gp for t in tokens)
-
-
 # -----------------------------
 # Profile builder
 # -----------------------------
@@ -349,6 +361,7 @@ def openai_get_candidates(
 - 키는 candidates 하나만 사용: {{ "candidates": ["title1", ...] }}
 - candidates는 정확히 {n}개.
 - 게임 제목은 가능한 한 공식적으로 통용되는 영문/국문 제목으로.
+- RAWG 같은 외부 DB 없이도 추천이 가능해야 하므로, 모호한 제목(시리즈명만 있는 것)은 피하고 가능한 구체적으로.
 
 {profile_text}
 """.strip()
@@ -378,6 +391,9 @@ def openai_select_from_facts(
     profile_text: str,
     factual_games: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    """
+    RAWG 팩트 기반: id로 선택 (개수 강제 X)
+    """
     compact = []
     for g in factual_games:
         compact.append(
@@ -414,8 +430,8 @@ def openai_select_from_facts(
 - selected의 id는 반드시 팩트 목록에 존재해야 한다.
 - 출력은 "유효한 JSON" 하나만 출력. (설명/마크다운/코드펜스 금지)
 - JSON 키는 스키마 예시와 동일하게.
-- summary_memo는 '요약/메모'로서 분량을 더 주고, 아래 요소를 가능하면 포함:
-  1) 핵심 재미 루프(예: 전투-파밍-빌드 / 탐험-수집-제작 등)
+- summary_memo는 분량을 더 주고, 아래 요소를 가능하면 포함:
+  1) 핵심 재미 루프
   2) 분위기/톤
   3) 플레이 팁 1개
   4) 주의점 1개
@@ -454,6 +470,79 @@ def openai_select_from_facts(
     return obj
 
 
+def openai_select_fallback_no_rawg(
+    client: OpenAI,
+    model: str,
+    system_instructions: str,
+    profile_text: str,
+    max_recs: int,
+) -> Dict[str, Any]:
+    """
+    RAWG 없이도 사이트를 사용할 수 있게:
+    - 게임명/설명 중심으로 추천(개수 강제 X, 최대 max_recs)
+    - 팩트(출시일/플랫폼/장르/표지)는 '확실할 때만' 적고 모르면 비움
+    """
+    schema_hint = {
+        "selected": [
+            {
+                "name": "string",
+                "released": "string or empty",
+                "genres": "string or empty",
+                "platforms": "string or empty",
+                "why_recommended": "string (2~3문장)",
+                "time_fit": "string",
+                "summary_memo": "string (요약/메모: 길게. 루프/톤/팁/주의점/추천 상황)",
+            }
+        ],
+        "summary": "string",
+        "accuracy_note": "string",
+    }
+
+    prompt = f"""
+너는 'Select Game'의 편집장(게임 잡지 스타일)이다.
+현재 외부 게임 DB(RAWG)가 없으므로, 게임 '정보 정확도'는 보수적으로 다뤄야 한다.
+
+규칙:
+- 추천 개수를 억지로 채우지 마라. 확신이 낮으면 제외한다. (0~{max_recs}개)
+- 출력은 "유효한 JSON" 하나만. (설명/마크다운/코드펜스 금지)
+- JSON 키는 스키마 예시와 동일하게.
+- released/genres/platforms는 '확실할 때만' 채우고, 애매하면 빈 문자열로 둔다.
+- summary_memo는 분량을 더 주고, 루프/톤/팁/주의점/추천 상황을 포함.
+- accuracy_note에는 "RAWG 키를 넣으면 정보 정확도가 올라간다"는 안내를 1~2문장으로 넣어라.
+
+[JSON 스키마 예시]
+{json.dumps(schema_hint, ensure_ascii=False, indent=2)}
+
+[사용자 선호 프로필]
+{profile_text}
+""".strip()
+
+    resp = client.responses.create(model=model, instructions=system_instructions, input=prompt)
+    text = (resp.output_text or "").strip()
+
+    # 파싱 실패 시 1회 수정
+    try:
+        obj = safe_json_loads(text)
+    except Exception:
+        fix_prompt = f"""
+아래 출력은 JSON 파싱에 실패했거나 조건을 어겼다.
+반드시 "유효한 JSON" 하나만 출력해서 수정해라. 다른 텍스트 금지.
+조건: selected는 0~{max_recs}개.
+
+[잘못된 출력]
+{text}
+""".strip()
+        resp2 = client.responses.create(model=model, instructions=system_instructions, input=fix_prompt)
+        obj = safe_json_loads(resp2.output_text)
+
+    sel = obj.get("selected", [])
+    if not isinstance(sel, list):
+        raise ValueError("추천 결과 JSON 형식이 올바르지 않습니다.")
+    # 안전: 최대 개수 제한
+    obj["selected"] = sel[:max_recs]
+    return obj
+
+
 def openai_chat(
     client: OpenAI,
     model: str,
@@ -472,12 +561,28 @@ def openai_chat(
 # -----------------------------
 with st.sidebar:
     st.markdown("## 🎮 Select Game")
-    st.caption("RAWG로 팩트를 확정하고, 편집장 스타일로 추천합니다.")
+    st.caption("게임 잡지처럼 추천합니다. (RAWG 키는 정확도 향상용 옵션)")
     st.markdown("---")
 
     st.markdown("### 🔑 Keys")
     openai_key = st.text_input("OpenAI API Key", type="password", placeholder="sk-...")
-    rawg_key = st.text_input("RAWG API Key", type="password", placeholder="RAWG 키")
+
+    rawg_key = st.text_input(
+        "RAWG API Key (선택)",
+        type="password",
+        placeholder="없어도 사용 가능",
+        help="RAWG 키를 넣으면 표지/출시일/장르/플랫폼 같은 게임 정보 정확도가 올라갑니다.",
+    )
+
+    st.markdown(
+        """
+<div class="sg-callout">
+<b>RAWG 키는 필수 아님.</b><br>
+키가 없으면 '추천'은 가능하지만, 출시일/플랫폼/장르/표지 같은 정보는 비워두거나 보수적으로 표시됩니다.
+</div>
+""",
+        unsafe_allow_html=True,
+    )
 
     st.markdown("---")
     st.markdown("### 🧩 취향 입력")
@@ -528,13 +633,14 @@ st.markdown(
 <div class="sg-hero">
   <h1>SELECT GAME</h1>
   <p>
-    게임 잡지처럼, <b>팩트는 RAWG</b>로 확정하고 <b>추천은 편집장 톤</b>으로 정리합니다.
-    억지 추천 없이 “확신 있는 게임만” 올려요.
+    게임 잡지처럼, <b>추천은 편집장 톤</b>으로 정리합니다.
+    RAWG 키를 넣으면 <b>표지/출시일/플랫폼/장르</b>까지 더 정확해져요.
   </p>
 </div>
 """,
     unsafe_allow_html=True,
 )
+
 
 profile_text = build_profile_text(
     preferred_genres=preferred_genres,
@@ -549,23 +655,20 @@ system_instructions = f"""
 너는 'Select Game'이라는 게임 추천 챗봇이다.
 - 한국어로 답한다.
 - 사용자의 선호 장르, 원하는 감정(자유입력 포함), 플레이한 게임, 플랫폼, 하루 플레이시간을 최우선 반영한다.
-- 게임 정보(출시일/플랫폼/장르/표지)는 RAWG 팩트를 우선한다.
 - 추천 개수는 억지로 채우지 않는다. 확신이 낮으면 제외한다.
 - 문체는 게임 잡지 편집장처럼: 짧고 임팩트 있게, 그러나 과장/허위는 금지.
-
-{profile_text}
 """.strip()
+
 
 # Session state
 if "messages" not in st.session_state:
     st.session_state.messages = [
-        {
-            "role": "assistant",
-            "content": "원하는 분위기/플랫폼/플레이 시간만 정확히 주면, 잡지 한 페이지처럼 추천해줄게.",
-        }
+        {"role": "assistant", "content": "원하는 분위기/플랫폼/플레이 시간만 정확히 주면, 잡지 한 페이지처럼 추천해줄게."}
     ]
 if "recommendations" not in st.session_state:
     st.session_state.recommendations = None
+if "rawg_mode" not in st.session_state:
+    st.session_state.rawg_mode = False
 
 
 # -----------------------------
@@ -574,91 +677,108 @@ if "recommendations" not in st.session_state:
 if get_recs:
     if not openai_key:
         st.error("OpenAI API 키를 먼저 입력해줘.")
-    elif not rawg_key:
-        st.error("RAWG API 키도 입력해줘. (게임 정보 확정용)")
     else:
         try:
             client = build_openai_client(openai_key)
 
-            with st.spinner("1) 후보 게임명 수집 중..."):
-                candidates = openai_get_candidates(
-                    client=client,
-                    model=model,
-                    system_instructions=system_instructions,
-                    profile_text=profile_text,
-                    n=CANDIDATE_COUNT,
-                )
+            # RAWG 키가 있으면 정확도 모드 ON
+            rawg_enabled = bool(rawg_key.strip())
+            st.session_state.rawg_mode = rawg_enabled
 
-            with st.spinner("2) RAWG에서 팩트 확정 중..."):
-                factual: List[Dict[str, Any]] = []
-                seen_ids = set()
-
-                for title in candidates:
-                    top = rawg_search_top(rawg_key, title)
-                    if not top or not top.get("id"):
-                        continue
-
-                    gid = int(top["id"])
-                    if gid in seen_ids:
-                        continue
-
-                    detail = rawg_game_detail(rawg_key, gid)
-                    plats = game_platforms(detail)
-
-                    if not platform_filter_pass(platforms, plats):
-                        continue
-
-                    seen_ids.add(gid)
-                    factual.append(
-                        {
-                            "id": gid,
-                            "name": detail.get("name") or top.get("name") or title,
-                            "released": detail.get("released"),
-                            "genres": game_genres(detail),
-                            "platforms": plats,
-                            "metacritic": detail.get("metacritic"),
-                            "rating": detail.get("rating"),
-                            "background_image": detail.get("background_image"),
-                        }
+            if rawg_enabled:
+                with st.spinner("1) 후보 게임명 수집 중..."):
+                    candidates = openai_get_candidates(
+                        client=client,
+                        model=model,
+                        system_instructions=system_instructions + "\n" + profile_text,
+                        profile_text=profile_text,
+                        n=CANDIDATE_COUNT,
                     )
 
-                    if len(factual) >= RAWG_MATCH_LIMIT:
-                        break
+                with st.spinner("2) RAWG에서 팩트 확정 중..."):
+                    factual: List[Dict[str, Any]] = []
+                    seen_ids = set()
 
-                if not factual:
-                    raise ValueError(
-                        "RAWG에서 매칭되는 게임을 찾지 못했습니다. 플랫폼 선택을 완화하거나, '재미있게 플레이한 게임'에 힌트를 더 넣어봐."
+                    for title in candidates:
+                        top = rawg_search_top(rawg_key, title)
+                        if not top or not top.get("id"):
+                            continue
+
+                        gid = int(top["id"])
+                        if gid in seen_ids:
+                            continue
+
+                        detail = rawg_game_detail(rawg_key, gid)
+                        plats = game_platforms(detail)
+
+                        if not platform_filter_pass(platforms, plats):
+                            continue
+
+                        seen_ids.add(gid)
+                        factual.append(
+                            {
+                                "id": gid,
+                                "name": detail.get("name") or top.get("name") or title,
+                                "released": detail.get("released"),
+                                "genres": game_genres(detail),
+                                "platforms": plats,
+                                "metacritic": detail.get("metacritic"),
+                                "rating": detail.get("rating"),
+                                "background_image": detail.get("background_image"),
+                            }
+                        )
+
+                        if len(factual) >= RAWG_MATCH_LIMIT:
+                            break
+
+                    if not factual:
+                        raise ValueError(
+                            "RAWG에서 매칭되는 게임을 찾지 못했습니다. 플랫폼 선택을 완화하거나, '재미있게 플레이한 게임'에 힌트를 더 넣어봐."
+                        )
+
+                with st.spinner("3) 확신 있는 게임만 선별/원고 작성 중..."):
+                    picked_obj = openai_select_from_facts(
+                        client=client,
+                        model=model,
+                        system_instructions=system_instructions + "\n" + profile_text,
+                        profile_text=profile_text,
+                        factual_games=factual,
                     )
 
-            with st.spinner("3) 확신 있는 게임만 선별/원고 작성 중..."):
-                picked_obj = openai_select_from_facts(
-                    client=client,
-                    model=model,
-                    system_instructions=system_instructions,
-                    profile_text=profile_text,
-                    factual_games=factual,
-                )
+                fact_map = {g["id"]: g for g in factual}
+                selected_merged: List[Dict[str, Any]] = []
 
-            fact_map = {g["id"]: g for g in factual}
-            selected_merged: List[Dict[str, Any]] = []
+                for s in picked_obj.get("selected", []):
+                    try:
+                        gid = int(s.get("id"))
+                    except Exception:
+                        continue
+                    if gid in fact_map:
+                        merged = {**fact_map[gid], **s}
+                        selected_merged.append(merged)
 
-            for s in picked_obj.get("selected", []):
-                try:
-                    gid = int(s.get("id"))
-                except Exception:
-                    continue
-                if gid in fact_map:
-                    merged = {**fact_map[gid], **s}
-                    selected_merged.append(merged)
+                st.session_state.recommendations = {
+                    "selected": selected_merged,
+                    "summary": picked_obj.get("summary", ""),
+                    "note": picked_obj.get("price_disclaimer", ""),
+                }
 
-            st.session_state.recommendations = {
-                "selected": selected_merged,
-                "summary": picked_obj.get("summary", ""),
-                "price_disclaimer": picked_obj.get(
-                    "price_disclaimer",
-                    "가격은 지역/세일/에디션에 따라 달라집니다. 스토어에서 최종 가격을 확인하세요.",
-                ),
-            }
+            else:
+                # RAWG 없이 fallback
+                with st.spinner("추천 원고 작성 중... (RAWG 없이 실행)"):
+                    picked_obj = openai_select_fallback_no_rawg(
+                        client=client,
+                        model=model,
+                        system_instructions=system_instructions + "\n" + profile_text,
+                        profile_text=profile_text,
+                        max_recs=FALLBACK_MAX_RECS,
+                    )
+
+                st.session_state.recommendations = {
+                    "selected": picked_obj.get("selected", []),
+                    "summary": picked_obj.get("summary", ""),
+                    "note": picked_obj.get("accuracy_note", ""),
+                }
 
         except Exception as e:
             st.session_state.recommendations = None
@@ -676,38 +796,60 @@ st.markdown(
   <span class="sg-pill">ISSUE</span>
   <h2>오늘의 추천 지면</h2>
 </div>
-<p class="sg-sub">추천은 확신 있는 게임만. 표지/장르/플랫폼/출시일은 RAWG 팩트를 사용합니다.</p>
+<p class="sg-sub">
+RAWG 키가 있으면 표지/출시일/장르/플랫폼까지 확정해서 더 정확합니다.
+</p>
 """,
     unsafe_allow_html=True,
 )
 
 if recs_obj is not None:
-    st.caption(recs_obj.get("price_disclaimer", ""))
+    if recs_obj.get("note"):
+        st.caption(recs_obj["note"])
 
     selected = recs_obj.get("selected", [])
     if not selected:
-        st.warning("이번 조건에선 확신 있게 추천할 게임이 부족했어. 플랫폼을 넓히거나 감정 자유입력을 더 구체적으로 써봐.")
+        st.warning("이번 조건에선 확신 있게 추천할 게임이 부족했어. 취향 힌트를 더 추가해줘.")
     else:
         cols = st.columns(3, gap="large")
+
         for idx, g in enumerate(selected):
             col = cols[idx % 3]
             with col:
-                cover = g.get("background_image")
-                title = g.get("name", "")
-                released = g.get("released") or "정보 없음"
-                genres = ", ".join(g.get("genres", [])) or "정보 없음"
-                plats = ", ".join(g.get("platforms", [])) or "정보 없음"
+                # RAWG 모드면 cover/팩트가 있음. fallback이면 거의 없음.
+                cover = g.get("background_image") if st.session_state.rawg_mode else None
 
-                meta_bits = [f"출시: {released}"]
-                if g.get("metacritic") is not None:
-                    meta_bits.append(f"MC {g['metacritic']}")
-                if g.get("rating") is not None:
-                    meta_bits.append(f"RAWG {g['rating']}")
-                meta_line = " · ".join(meta_bits)
+                title = g.get("name") or g.get("title") or ""
+                released = g.get("released") or ""
+                genres = ""
+                plats = ""
+
+                # RAWG 모드
+                if st.session_state.rawg_mode:
+                    genres = ", ".join(g.get("genres", [])) if isinstance(g.get("genres"), list) else ""
+                    plats = ", ".join(g.get("platforms", [])) if isinstance(g.get("platforms"), list) else ""
+                else:
+                    # fallback 모드(문자열로 들어옴)
+                    genres = g.get("genres", "") or ""
+                    plats = g.get("platforms", "") or ""
+
+                meta_bits = []
+                if released:
+                    meta_bits.append(f"출시: {released}")
+                if st.session_state.rawg_mode:
+                    if g.get("metacritic") is not None:
+                        meta_bits.append(f"MC {g['metacritic']}")
+                    if g.get("rating") is not None:
+                        meta_bits.append(f"RAWG {g['rating']}")
+                meta_line = " · ".join(meta_bits) if meta_bits else "정보: 제한적"
 
                 why = (g.get("why_recommended") or "").strip()
                 time_fit = (g.get("time_fit") or "").strip()
                 memo = (g.get("summary_memo") or "").strip()
+
+                # 태그 텍스트는 비어있으면 출력 줄이기
+                genre_tag = f'<span class="sg-tag">장르: {genres}</span>' if genres else ""
+                plat_tag = f'<span class="sg-tag">플랫폼: {plats}</span>' if plats else ""
 
                 card_html = f"""
 <div class="sg-card">
@@ -717,8 +859,8 @@ if recs_obj is not None:
 
     <div class="sg-meta">
       <span class="sg-tag">{meta_line}</span>
-      <span class="sg-tag">장르: {genres}</span>
-      <span class="sg-tag">플랫폼: {plats}</span>
+      {genre_tag}
+      {plat_tag}
     </div>
 
     <div class="sg-divider"></div>
@@ -740,7 +882,7 @@ if recs_obj is not None:
   </div>
 </div>
 """
-                # ✅ 핵심 수정: st.markdown -> st.html (HTML이 텍스트로 출력되는 문제 해결)
+                # HTML 렌더 안정화 (태그가 텍스트로 보이는 문제 방지)
                 st.html(card_html)
 
         if recs_obj.get("summary"):
@@ -793,7 +935,7 @@ if user_text:
                 assistant_text = openai_chat(
                     client=client,
                     model=model,
-                    system_instructions=system_instructions,
+                    system_instructions=system_instructions + "\n" + profile_text,
                     messages=st.session_state.messages,
                 )
             st.session_state.messages.append({"role": "assistant", "content": assistant_text})
