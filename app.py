@@ -25,7 +25,7 @@ TIMEOUT = 15
 CANDIDATE_COUNT = 18
 RAWG_MATCH_LIMIT = 18
 
-# RAWG 키가 없을 때: 모델만으로 추천은 가능하되, "팩트(표지/출시일/플랫폼/장르)"는 보수적으로
+# RAWG 키가 없을 때: 모델만으로 추천은 가능하되, 팩트는 보수적으로
 FALLBACK_MAX_RECS = 8
 
 
@@ -152,20 +152,30 @@ section[data-testid="stSidebar"] button{
   margin: 0;
   line-height: 1.2;
 }
-.sg-meta{
-  margin-top: 8px;
-  display:flex;
-  flex-wrap: wrap;
-  gap: 8px;
+
+/* new: info block (same readability as content) */
+.sg-info{
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(255,255,255,.10);
+  background: rgba(255,255,255,.04);
 }
-.sg-tag{
-  font-size: 12px;
+.sg-info .sg-row{
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.55;
   color: var(--ink);
-  padding: 5px 9px;
-  border-radius: 999px;
-  border: 1px solid rgba(255,255,255,.12);
-  background: rgba(255,255,255,.05);
 }
+.sg-info .sg-key{
+  color: var(--muted);
+  font-weight: 600;
+}
+.sg-info .sg-val{
+  color: var(--ink);
+}
+
+/* content text */
 .sg-text{
   margin-top: 10px;
   color: var(--ink);
@@ -273,11 +283,7 @@ def rawg_search_top(rawg_key: str, query: str) -> Optional[Dict[str, Any]]:
     data = rawg_get(
         rawg_key,
         "/games",
-        params={
-            "search": query,
-            "page_size": 5,
-            "search_precise": True,
-        },
+        params={"search": query, "page_size": 5, "search_precise": True},
     )
     results = data.get("results") or []
     return results[0] if results else None
@@ -294,6 +300,7 @@ def game_platforms(detail: Dict[str, Any]) -> List[str]:
         name = (p.get("platform") or {}).get("name")
         if name:
             out.append(name)
+    # uniq preserve order
     seen = set()
     uniq = []
     for x in out:
@@ -369,6 +376,7 @@ def openai_get_candidates(
     if not isinstance(cands, list) or len(cands) != n:
         raise ValueError("후보 게임명 생성(JSON) 실패 또는 개수 불일치")
 
+    # dedupe
     cands = [str(x).strip() for x in cands if str(x).strip()]
     seen = set()
     uniq: List[str] = []
@@ -405,9 +413,9 @@ def openai_select_from_facts(
         "selected": [
             {
                 "id": 123,
-                "why_recommended": "string (2~3문장)",
-                "time_fit": "string (플레이시간 적합 설명)",
-                "summary_memo": "string (요약/메모: 더 길게. 난이도/분위기/플레이 루프/주의점/추천 상황 포함)",
+                "one_liner": "string (한줄 추천, 1~2문장)",
+                "why_for_user": "string (사용자 입력과 연결해 2~4문장)",
+                "summary_memo": "string (요약/메모: 더 길게. 루프/톤/팁/주의점/추천 상황 포함)",
             }
         ],
         "summary": "string",
@@ -423,12 +431,13 @@ def openai_select_from_facts(
 - selected의 id는 반드시 팩트 목록에 존재해야 한다.
 - 출력은 "유효한 JSON" 하나만 출력. (설명/마크다운/코드펜스 금지)
 - JSON 키는 스키마 예시와 동일하게.
+- one_liner: 1~2문장
+- why_for_user: 사용자의 입력(선호 장르/원하는 사항/플랫폼/플레이시간/재밌게 한 게임)과 "왜 어울리는지"를 연결해서 2~4문장
 - summary_memo는 분량을 더 주고, 아래 요소를 가능하면 포함:
   1) 핵심 재미 루프
   2) 분위기/톤
   3) 플레이 팁 1개
   4) 주의점 1개
-- why_recommended는 2~3문장으로 짧고 날카롭게.
 
 [JSON 스키마 예시]
 {json.dumps(schema_hint, ensure_ascii=False, indent=2)}
@@ -457,8 +466,7 @@ def openai_select_from_facts(
         resp2 = client.responses.create(model=model, instructions=system_instructions, input=fix_prompt)
         obj = safe_json_loads(resp2.output_text)
 
-    sel = obj.get("selected", [])
-    if not isinstance(sel, list):
+    if not isinstance(obj.get("selected", None), list):
         raise ValueError("선정 결과 JSON 형식이 올바르지 않습니다.")
     return obj
 
@@ -477,8 +485,8 @@ def openai_select_fallback_no_rawg(
                 "released": "string or empty",
                 "genres": "string or empty",
                 "platforms": "string or empty",
-                "why_recommended": "string (2~3문장)",
-                "time_fit": "string",
+                "one_liner": "string (한줄 추천, 1~2문장)",
+                "why_for_user": "string (사용자 입력과 연결해 2~4문장)",
                 "summary_memo": "string (요약/메모: 길게. 루프/톤/팁/주의점/추천 상황)",
             }
         ],
@@ -495,8 +503,10 @@ def openai_select_fallback_no_rawg(
 - 출력은 "유효한 JSON" 하나만. (설명/마크다운/코드펜스 금지)
 - JSON 키는 스키마 예시와 동일하게.
 - released/genres/platforms는 '확실할 때만' 채우고, 애매하면 빈 문자열로 둔다.
-- summary_memo는 루프/톤/팁/주의점/추천 상황을 포함해 길게 쓴다.
-- accuracy_note에는 "RAWG 키를 넣으면 정보 정확도가 올라간다" 안내를 1~2문장으로 넣어라.
+- one_liner: 1~2문장
+- why_for_user: 사용자 입력과 연결해 2~4문장
+- summary_memo: 루프/톤/팁/주의점/추천 상황을 포함해 길게
+- accuracy_note: RAWG 키를 넣으면 정보 정확도가 올라간다는 안내를 1~2문장
 
 [JSON 스키마 예시]
 {json.dumps(schema_hint, ensure_ascii=False, indent=2)}
@@ -618,9 +628,7 @@ st.markdown(
     """
 <div class="sg-hero">
   <h1>SELECT GAME</h1>
-  <p>
-    사용자의 조건에 딱 알맞은 명작 게임을 추천해드립니다:)
-  </p>
+  <p>사용자의 조건에 딱 알맞은 명작 게임을 추천해드립니다:)</p>
 </div>
 """,
     unsafe_allow_html=True,
@@ -776,9 +784,7 @@ st.markdown(
   <span class="sg-pill">ISSUE</span>
   <h2>오늘의 추천 지면</h2>
 </div>
-<p class="sg-sub">
-추천은 확신 있는 게임만. (RAWG 키가 있으면 표지/출시일/장르/플랫폼 정보가 더 정확해집니다)
-</p>
+<p class="sg-sub">추천은 확신 있는 게임만.</p>
 """,
     unsafe_allow_html=True,
 )
@@ -803,29 +809,46 @@ if recs_obj is not None:
                 genres = ""
                 plats = ""
 
+                mc = None
+                rawg_rating = None
+
                 if st.session_state.rawg_mode:
                     genres = ", ".join(g.get("genres", [])) if isinstance(g.get("genres"), list) else ""
                     plats = ", ".join(g.get("platforms", [])) if isinstance(g.get("platforms"), list) else ""
+                    mc = g.get("metacritic")
+                    rawg_rating = g.get("rating")
                 else:
                     genres = g.get("genres", "") or ""
                     plats = g.get("platforms", "") or ""
 
-                meta_bits = []
-                if released:
-                    meta_bits.append(f"출시: {released}")
-                if st.session_state.rawg_mode:
-                    if g.get("metacritic") is not None:
-                        meta_bits.append(f"MC {g['metacritic']}")
-                    if g.get("rating") is not None:
-                        meta_bits.append(f"RAWG {g['rating']}")
-                meta_line = " · ".join(meta_bits) if meta_bits else "정보: 제한적"
-
-                why = (g.get("why_recommended") or "").strip()
-                time_fit = (g.get("time_fit") or "").strip()
+                one_liner = (g.get("one_liner") or "").strip()
+                why_for_user = (g.get("why_for_user") or "").strip()
                 memo = (g.get("summary_memo") or "").strip()
 
-                genre_tag = f'<span class="sg-tag">장르: {genres}</span>' if genres else ""
-                plat_tag = f'<span class="sg-tag">플랫폼: {plats}</span>' if plats else ""
+                # info rows (bigger & placed above one-liner)
+                row_release = f"<p class='sg-row'><span class='sg-key'>출시</span>: <span class='sg-val'>{released}</span></p>" if released else ""
+                row_genre = f"<p class='sg-row'><span class='sg-key'>장르</span>: <span class='sg-val'>{genres}</span></p>" if genres else ""
+                row_plat = f"<p class='sg-row'><span class='sg-key'>플랫폼</span>: <span class='sg-val'>{plats}</span></p>" if plats else ""
+
+                row_scores = ""
+                score_bits = []
+                if mc is not None:
+                    score_bits.append(f"MC {mc}")
+                if rawg_rating is not None:
+                    score_bits.append(f"RAWG {rawg_rating}")
+                if score_bits:
+                    row_scores = f"<p class='sg-row'><span class='sg-key'>스코어</span>: <span class='sg-val'>{' · '.join(score_bits)}</span></p>"
+
+                info_block = ""
+                if row_release or row_genre or row_plat or row_scores:
+                    info_block = f"""
+<div class="sg-info">
+  {row_release}
+  {row_scores}
+  {row_genre}
+  {row_plat}
+</div>
+"""
 
                 card_html = f"""
 <div class="sg-card">
@@ -833,22 +856,18 @@ if recs_obj is not None:
   <div class="sg-body">
     <h3 class="sg-title">{idx+1}. {title}</h3>
 
-    <div class="sg-meta">
-      <span class="sg-tag">{meta_line}</span>
-      {genre_tag}
-      {plat_tag}
-    </div>
+    {info_block}
 
     <div class="sg-divider"></div>
 
     <div class="sg-text">
       <b>한줄 추천</b><br>
-      <span class="sg-muted">{why if why else "—"}</span>
+      <span class="sg-muted">{one_liner if one_liner else "—"}</span>
     </div>
 
     <div class="sg-text">
-      <b>플레이 타임 핏</b><br>
-      <span class="sg-muted">{time_fit if time_fit else "—"}</span>
+      <b>사용자에게 추천하는 이유</b><br>
+      <span class="sg-muted">{why_for_user if why_for_user else "—"}</span>
     </div>
 
     <div class="sg-text">
