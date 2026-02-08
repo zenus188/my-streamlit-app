@@ -181,12 +181,6 @@ section[data-testid="stSidebar"] button{
   background: var(--line);
   margin: 12px 0;
 }
-.sg-links a{
-  text-decoration: none;
-}
-.sg-links a:hover{
-  text-decoration: underline;
-}
 
 /* Chat look */
 [data-testid="stChatMessage"]{
@@ -214,20 +208,15 @@ def build_openai_client(api_key: str) -> OpenAI:
 
 def safe_json_loads(s: str) -> Dict[str, Any]:
     s = (s or "").strip()
-
-    # code fence 방어
     if s.startswith("```"):
         s = re.sub(r"^```[a-zA-Z]*\n?", "", s).strip()
         s = re.sub(r"\n?```$", "", s).strip()
-
-    # 최후: 첫 '{'~마지막 '}' 추출 시도
     if "{" in s and "}" in s:
         s2 = s[s.find("{") : s.rfind("}") + 1].strip()
         try:
             return json.loads(s2)
         except Exception:
             pass
-
     return json.loads(s)
 
 
@@ -303,16 +292,6 @@ def game_genres(detail: Dict[str, Any]) -> List[str]:
         if name:
             out.append(name)
     return out
-
-
-def game_stores(detail: Dict[str, Any]) -> List[Dict[str, str]]:
-    stores = []
-    for s in detail.get("stores") or []:
-        store_name = (s.get("store") or {}).get("name")
-        url = s.get("url")
-        if store_name and url:
-            stores.append({"name": store_name, "url": url})
-    return stores
 
 
 def platform_filter_pass(user_platforms: List[str], game_plats: List[str]) -> bool:
@@ -399,12 +378,6 @@ def openai_select_from_facts(
     profile_text: str,
     factual_games: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """
-    요구사항:
-    - '맞는감정' 제거
-    - '주의/메모' -> '요약/메모'로 변경 + 내용 더 추가(더 길고 구체적)
-    - 추천 개수 고정 X: 정말 잘 맞는 것만
-    """
     compact = []
     for g in factual_games:
         compact.append(
@@ -442,10 +415,10 @@ def openai_select_from_facts(
 - 출력은 "유효한 JSON" 하나만 출력. (설명/마크다운/코드펜스 금지)
 - JSON 키는 스키마 예시와 동일하게.
 - summary_memo는 '요약/메모'로서 분량을 더 주고, 아래 요소를 가능하면 포함:
-  1) 게임의 핵심 재미 루프(예: 전투-파밍-빌드 / 탐험-수집-제작 등)
-  2) 분위기/톤(힐링/긴장/코지/하드코어 등)
-  3) 플레이 팁 1개(초반 빌드/설정/추천 난이도 등)
-  4) 주의점 1개(멀미/난이도/호불호 포인트/시간 빨림 등)
+  1) 핵심 재미 루프(예: 전투-파밍-빌드 / 탐험-수집-제작 등)
+  2) 분위기/톤
+  3) 플레이 팁 1개
+  4) 주의점 1개
 - why_recommended는 2~3문장으로 짧고 날카롭게.
 
 [JSON 스키마 예시]
@@ -461,7 +434,6 @@ def openai_select_from_facts(
     resp = client.responses.create(model=model, instructions=system_instructions, input=prompt)
     text = (resp.output_text or "").strip()
 
-    # 파싱 실패 시 1회 수정 요청
     try:
         obj = safe_json_loads(text)
     except Exception:
@@ -519,7 +491,7 @@ with st.sidebar:
     emotions = st.multiselect("원하는 감정(선지)", EMOTIONS, default=[])
     emotions_free = st.text_input(
         "원하는 감정(자유 입력)",
-        placeholder="예: 잔잔한 코지, 미친 손맛, 스팀팩 같은 타격감, 여운 있는 스토리…",
+        placeholder="예: 잔잔한 코지, 미친 손맛, 여운 있는 스토리…",
     )
 
     played_games = st.text_area(
@@ -647,7 +619,6 @@ if get_recs:
                             "metacritic": detail.get("metacritic"),
                             "rating": detail.get("rating"),
                             "background_image": detail.get("background_image"),
-                            "stores": game_stores(detail),
                         }
                     )
 
@@ -685,7 +656,7 @@ if get_recs:
                 "summary": picked_obj.get("summary", ""),
                 "price_disclaimer": picked_obj.get(
                     "price_disclaimer",
-                    "가격은 지역/세일/에디션에 따라 달라집니다. 스토어 링크에서 최종 가격을 확인하세요.",
+                    "가격은 지역/세일/에디션에 따라 달라집니다. 스토어에서 최종 가격을 확인하세요.",
                 ),
             }
 
@@ -715,9 +686,8 @@ if recs_obj is not None:
 
     selected = recs_obj.get("selected", [])
     if not selected:
-        st.warning("이번 조건에선 확신 있게 추천할 게임이 부족했어. 플랫폼을 넓히거나(예: PC 추가), 감정 자유입력을 더 구체적으로 써봐.")
+        st.warning("이번 조건에선 확신 있게 추천할 게임이 부족했어. 플랫폼을 넓히거나 감정 자유입력을 더 구체적으로 써봐.")
     else:
-        # 3열 카드 그리드(잡지 레이아웃 느낌)
         cols = st.columns(3, gap="large")
         for idx, g in enumerate(selected):
             col = cols[idx % 3]
@@ -728,26 +698,23 @@ if recs_obj is not None:
                 genres = ", ".join(g.get("genres", [])) or "정보 없음"
                 plats = ", ".join(g.get("platforms", [])) or "정보 없음"
 
-                meta_bits = []
-                meta_bits.append(f"출시: {released}")
+                meta_bits = [f"출시: {released}"]
                 if g.get("metacritic") is not None:
                     meta_bits.append(f"MC {g['metacritic']}")
                 if g.get("rating") is not None:
                     meta_bits.append(f"RAWG {g['rating']}")
                 meta_line = " · ".join(meta_bits)
 
-                why = g.get("why_recommended", "").strip()
-                time_fit = g.get("time_fit", "").strip()
-                memo = g.get("summary_memo", "").strip()
+                why = (g.get("why_recommended") or "").strip()
+                time_fit = (g.get("time_fit") or "").strip()
+                memo = (g.get("summary_memo") or "").strip()
 
-                stores = g.get("stores", [])[:4]
-
-                # Build HTML card
                 card_html = f"""
 <div class="sg-card">
   {f'<img class="sg-cover" src="{cover}" />' if cover else ''}
   <div class="sg-body">
     <h3 class="sg-title">{idx+1}. {title}</h3>
+
     <div class="sg-meta">
       <span class="sg-tag">{meta_line}</span>
       <span class="sg-tag">장르: {genres}</span>
@@ -756,23 +723,29 @@ if recs_obj is not None:
 
     <div class="sg-divider"></div>
 
-    <div class="sg-text"><b>한줄 추천</b><br><span class="sg-muted">{why if why else "—"}</span></div>
-    <div class="sg-text"><b>플레이 타임 핏</b><br><span class="sg-muted">{time_fit if time_fit else "—"}</span></div>
-    <div class="sg-text"><b>요약/메모</b><br><span class="sg-muted">{memo if memo else "—"}</span></div>
+    <div class="sg-text">
+      <b>한줄 추천</b><br>
+      <span class="sg-muted">{why if why else "—"}</span>
+    </div>
 
-    <div class="sg-divider"></div>
+    <div class="sg-text">
+      <b>플레이 타임 핏</b><br>
+      <span class="sg-muted">{time_fit if time_fit else "—"}</span>
+    </div>
 
-    <div class="sg-text sg-links"><b>스토어</b><br>
-      {"".join([f'- <a href="{s["url"]}" target="_blank">{s["name"]}</a><br>' for s in stores]) if stores else '<span class="sg-muted">스토어 링크 정보 없음(또는 RAWG 미제공)</span>'}
+    <div class="sg-text">
+      <b>요약/메모</b><br>
+      <span class="sg-muted">{memo if memo else "—"}</span>
     </div>
   </div>
 </div>
 """
-                st.markdown(card_html, unsafe_allow_html=True)
+                # ✅ 핵심 수정: st.markdown -> st.html (HTML이 텍스트로 출력되는 문제 해결)
+                st.html(card_html)
 
         if recs_obj.get("summary"):
             st.markdown(
-                f"""
+                """
 <div class="sg-section">
   <span class="sg-pill">EDITOR'S NOTE</span>
   <h2>편집장 메모</h2>
@@ -784,7 +757,7 @@ if recs_obj is not None:
 
 
 # -----------------------------
-# Chat (kept simple, magazine + Q&A corner vibe)
+# Chat (Q&A corner)
 # -----------------------------
 st.markdown(
     """
